@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import math
 
 st.set_page_config(page_title="Ingeniería de Tráfico: Onda Verde Pro 2026", layout="wide")
 
@@ -8,9 +9,12 @@ st.set_page_config(page_title="Ingeniería de Tráfico: Onda Verde Pro 2026", la
 def main():
     st.title("🚦 Diseño Profesional de Onda Verde")
     st.markdown("""
-    Diagrama técnico de **bandas paralelas rígidas**.  
-    Incluye **validación automática** y **auto-ajuste de `t_ini`** (A→...).  
-    Optimizado para la versión de Streamlit 2026.
+    Diagrama técnico de **bandas paralelas rígidas** (tiempo–distancia).  
+    Incluye:
+    - **Validación automática** de banda (ciclo base)
+    - **Auto-ajuste de `t_ini`**
+    - **Optimización real**: búsqueda automática de **banda máxima** (ancho máximo) ajustando `t_ini` y/o offsets  
+    Optimizado para Streamlit 2026.
     """)
 
     # --- ESTADO DE SESIÓN ---
@@ -55,32 +59,33 @@ def main():
             )
             config.append({"ID": name, "Offset": off, "Verde": ver, "Dist": dist})
 
-    # --- CÁLCULO DE BANDA ---
+    # --- DATAFRAME ---
     df = pd.DataFrame(config)
     df["Dist_Acum"] = df["Dist"].cumsum()
     verde_min = int(df["Verde"].min())
 
+    # --- SLIDERS BANDA (con key para poder actualizarlos desde optimización) ---
     st.sidebar.divider()
     t_ini = st.sidebar.slider("Inicio Banda (Cruce A)", 0, int(c_total), key="t_ini")
-    ancho = st.sidebar.slider("Ancho de Banda [s]", 1, int(verde_min), int(verde_min))
+    ancho = st.sidebar.slider("Ancho de Banda [s]", 1, int(verde_min), int(verde_min), key="ancho")
 
-    # --- FUNCIÓN DE "OPTIMIZACIÓN" (alineación offsets) ---
-    def optimizar_offsets():
+    # --- FUNCIÓN: ALINEAR OFFSETS AL INICIO DE BANDA (se mantiene) ---
+    def optimizar_offsets_simple():
         base_t = st.session_state.t_ini
         for i, row in df.iterrows():
             t_viaje = row["Dist_Acum"] / v_ms
             st.session_state[f"off_{i}"] = int((base_t + t_viaje) % c_total)
 
-    st.button("🎯 Alinear Offsets al Inicio de Banda", on_click=optimizar_offsets)
+    st.button("🎯 Alinear Offsets al Inicio de Banda", on_click=optimizar_offsets_simple)
 
     # -------------------------
-    # UTILIDADES DE VALIDACIÓN
+    # UTILIDADES DE TIEMPO / INTERVALOS EN CÍRCULO
     # -------------------------
+    def modC(x, C):
+        return float(x) % float(C)
+
     def green_windows(offset, verde, C):
-        """
-        Devuelve lista de intervalos (start, end) en [0,C)
-        donde el verde está activo. Maneja wrap-around.
-        """
+        """Ventanas verdes dentro de [0,C). Maneja wrap-around."""
         s = float(offset)
         d = float(verde)
         if d <= 0:
@@ -90,27 +95,91 @@ def main():
         return [(s, float(C)), (0.0, (s + d) - float(C))]
 
     def split_interval_modC(start, duration, C):
-        """
-        Intervalo [start, start+duration] mod C.
-        Devuelve 1 o 2 intervalos dentro de [0,C).
-        """
-        start = float(start) % float(C)
+        """Intervalo [start, start+duration] mod C en 1 o 2 intervalos dentro de [0,C)."""
+        start = modC(start, C)
         end_raw = start + float(duration)
         if end_raw <= float(C):
             return [(start, end_raw)]
         end = end_raw - float(C)
         return [(start, float(C)), (0.0, end)]
 
+    def circular_interval(start, end, C):
+        """
+        Intervalo circular [start, end] mod C, devuelto como lista de intervalos en [0,C).
+        Si el intervalo "invertido" representa wrap.
+        """
+        C = float(C)
+        start = float(start)
+        end = float(end)
+        # Nota: No asumimos start/end ya mod C para poder manejar rangos negativos
+        start_m = start % C
+        end_m = end % C
+        # Si el rango original (end-start) cubre >=C, entonces es todo el ciclo
+        if (end - start) >= C:
+            return [(0.0, C)]
+        # Si no hay wrap
+        if start_m <= end_m:
+            return [(start_m, end_m)]
+        # Wrap
+        return [(start_m, C), (0.0, end_m)]
+
+    def intersect_intervals(A, B):
+        """Intersección de dos listas de intervalos [s,e] (s<=e) en [0,C)."""
+        out = []
+        for (a1, a2) in A:
+            for (b1, b2) in B:
+                s = max(a1, b1)
+                e = min(a2, b2)
+                if e > s + 1e-9:  # tolerancia
+                    out.append((s, e))
+        # compactar (merge)
+        if not out:
+            return []
+        out.sort()
+        merged = [out[0]]
+        for (s, e) in out[1:]:
+            ps, pe = merged[-1]
+            if s <= pe + 1e-9:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    def union_intervals(intervals):
+        if not intervals:
+            return []
+        intervals = [(float(s), float(e)) for s, e in intervals if e > s + 1e-9]
+        if not intervals:
+            return []
+        intervals.sort()
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            ps, pe = merged[-1]
+            if s <= pe + 1e-9:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        return merged
+
+    def circular_distance(a, b, C):
+        """Distancia mínima circular entre dos instantes a,b en [0,C)."""
+        C = float(C)
+        d = abs((float(a) - float(b)) % C)
+        return min(d, C - d)
+
+    # -------------------------
+    # VALIDACIÓN Y MÁRGENES (ciclo base)
+    # -------------------------
     def interval_inside_green(b_start, b_end, windows):
         """
         Comprueba si [b_start,b_end] cabe dentro de alguna ventana verde.
-        Si cabe: (ok=True, margen_izq>=0, margen_der>=0, "OK")
-        Si no:  (ok=False, márgenes (pueden ser negativos), detalle)
+        Devuelve ok, margen_izq, margen_der, detalle.
         """
         for (gs, ge) in windows:
             if b_start >= gs and b_end <= ge:
                 return True, (b_start - gs), (ge - b_end), "OK"
 
+        # Diagnóstico: mejor solape
         best = None
         best_overlap = -1.0
         for (gs, ge) in windows:
@@ -129,60 +198,52 @@ def main():
             return False, (b_start - gs), (ge - b_end), "Termina después del verde"
         return False, (b_start - gs), (ge - b_end), "No cabe en ninguna ventana verde"
 
-    def validate_at_tini(tini_value, build_table=False):
+    def validate_at_params(tini_value, ancho_value, build_table=False):
         """
-        Valida la banda en ciclo base para un tini_value.
+        Valida la banda en ciclo base para un tini y ancho dados.
         Devuelve:
-          ok_count, all_ok, min_slack_global, sum_slack, invalid_ids, (optional) table_df
+          ok_count, all_ok, min_slack_global, sum_slack, invalid_ids, table_df
         """
         invalid_ids = set()
         rows = [] if build_table else None
 
         ok_count = 0
-        slacks = []     # slack por cruce (el mínimo de sus márgenes)
+        slacks = []
         sum_slack = 0.0
-
         C = float(c_total)
 
         for _, row in df.iterrows():
             cruce = row["ID"]
             x = float(row["Dist_Acum"])
             t_arr = (float(tini_value) + (x / v_ms)) % C
-            band_intervals = split_interval_modC(t_arr, float(ancho), C)
-
+            band_intervals = split_interval_modC(t_arr, float(ancho_value), C)
             windows = green_windows(row["Offset"], row["Verde"], C)
 
             ok_all = True
             worst_detail = "OK"
 
-            # holguras por cruce: nos quedamos con el mínimo margen (más restrictivo)
             cruce_slacks = []
-
-            # para tabla: guardamos márgenes "representativos"
             min_mi = None
             min_md = None
 
             for (bs, be) in band_intervals:
                 ok, mi, md, detail = interval_inside_green(bs, be, windows)
 
-                # Para diagnóstico/tabla
                 min_mi = mi if (min_mi is None) else min(min_mi, mi)
                 min_md = md if (min_md is None) else min(min_md, md)
 
-                if ok:
-                    cruce_slacks.append(min(mi, md))
-                else:
+                # "Holgura" por intervalo: mínimo margen
+                cruce_slacks.append(min(mi, md))
+
+                if not ok:
                     ok_all = False
                     worst_detail = detail
-                    # En fallo también metemos "slack" para puntuar (puede ser negativo)
-                    cruce_slacks.append(min(mi, md))
 
             if ok_all:
                 ok_count += 1
             else:
                 invalid_ids.add(cruce)
 
-            # slack del cruce: mínimo de los intervalos (si hay 2 por wrap)
             cruce_slack = min(cruce_slacks) if cruce_slacks else 0.0
             slacks.append(cruce_slack)
             sum_slack += cruce_slack
@@ -202,12 +263,12 @@ def main():
 
         all_ok = (ok_count == len(df))
         min_slack_global = min(slacks) if slacks else 0.0
-
         table_df = pd.DataFrame(rows) if build_table else None
+
         return ok_count, all_ok, float(min_slack_global), float(sum_slack), invalid_ids, table_df
 
     # -------------------------
-    # AUTO-AJUSTE DE t_ini
+    # AUTO-AJUSTE DE t_ini (se mantiene, usa ancho actual)
     # -------------------------
     st.sidebar.divider()
     st.sidebar.subheader("🛠️ Auto-ajuste de t_ini")
@@ -215,20 +276,16 @@ def main():
     def auto_ajustar_tini():
         C = int(c_total)
         best = None
-        # best = (ok_count, all_ok, min_slack_global, sum_slack, tini)
         for tini_candidate in range(C):
-            ok_count, all_ok, min_slack, sum_slack, _, _ = validate_at_tini(tini_candidate, build_table=False)
+            ok_count, all_ok, min_slack, sum_slack, _, _ = validate_at_params(
+                tini_candidate, st.session_state.ancho, build_table=False
+            )
             candidate = (ok_count, all_ok, min_slack, sum_slack, tini_candidate)
-
             if best is None:
                 best = candidate
                 continue
 
-            # Orden de decisión:
-            # 1) más cruces OK
-            # 2) preferir all_ok si empatan ok_count (redundante, pero explícito)
-            # 3) mayor holgura mínima global
-            # 4) mayor suma de holguras
+            # 1) más OK, 2) all_ok, 3) mayor holgura mínima, 4) mayor suma holguras
             if candidate[0] > best[0]:
                 best = candidate
             elif candidate[0] == best[0]:
@@ -237,9 +294,8 @@ def main():
                 elif candidate[1] == best[1]:
                     if candidate[2] > best[2]:
                         best = candidate
-                    elif candidate[2] == best[2]:
-                        if candidate[3] > best[3]:
-                            best = candidate
+                    elif candidate[2] == best[2] and candidate[3] > best[3]:
+                        best = candidate
 
         if best is not None:
             _, all_ok, min_slack, _, tini_best = best
@@ -251,9 +307,8 @@ def main():
             }
             st.rerun()
 
-    st.sidebar.button("🛠️ Auto-ajustar t_ini (máxima validez)", on_click=auto_ajustar_tini)
+    st.sidebar.button("🛠️ Auto-ajustar t_ini (ancho actual)", on_click=auto_ajustar_tini)
 
-    # Mostrar info del último auto-ajuste (si existe)
     if "auto_tini_info" in st.session_state:
         info = st.session_state["auto_tini_info"]
         if info.get("all_ok", False):
@@ -263,19 +318,223 @@ def main():
         st.sidebar.caption(f"Holgura mínima (global): {info.get('min_slack', 0.0):.2f} s")
 
     # -------------------------
+    # OPTIMIZACIÓN REAL (BANDA MÁXIMA)
+    # -------------------------
+    st.sidebar.divider()
+    st.sidebar.subheader("📈 Optimización real (banda máxima)")
+
+    modo = st.sidebar.radio(
+        "Modo de optimización",
+        [
+            "Offsets fijos (optimiza ancho + t_ini)",
+            "Optimiza t_ini + offsets (ancho máximo global, minimiza cambios)"
+        ],
+        index=0
+    )
+
+    def feasible_tini_intervals_for_width(w):
+        """
+        Dado un ancho w (segundos), calcula el conjunto de t_ini en [0,C)
+        que hace la banda factible en TODOS los cruces, con offsets fijos.
+        Devuelve lista de intervalos en [0,C).
+        """
+        C = float(c_total)
+        feasible = [(0.0, C)]
+        for _, row in df.iterrows():
+            verde = float(row["Verde"])
+            if float(w) > verde + 1e-9:
+                return []  # imposible en este cruce
+
+            t_travel = float(row["Dist_Acum"]) / v_ms
+            windows = green_windows(row["Offset"], row["Verde"], C)
+
+            valid_tini = []
+            for (gs, ge) in windows:
+                # arrival_start ∈ [gs, ge - w]
+                ge_w = ge - float(w)
+                if ge_w <= gs + 1e-9:
+                    continue
+                # t_ini ∈ [gs - t_travel, (ge - w) - t_travel] mod C
+                ints = circular_interval(gs - t_travel, ge_w - t_travel, C)
+                valid_tini.extend(ints)
+
+            valid_tini = union_intervals(valid_tini)
+            feasible = intersect_intervals(feasible, valid_tini)
+            if not feasible:
+                return []
+
+        return feasible
+
+    def pick_best_tini_from_intervals(intervals, w):
+        """
+        Escoge el mejor t_ini entero dentro de intervals, maximizando:
+        1) holgura mínima global
+        2) suma de holguras
+        """
+        C = int(c_total)
+        best = None  # (min_slack, sum_slack, tini)
+        for (s, e) in intervals:
+            # candidatos enteros dentro del intervalo
+            a = int(math.ceil(s - 1e-9))
+            b = int(math.floor(e + 1e-9))
+            for tini in range(a, b + 1):
+                tini = tini % C
+                _, all_ok, min_slack, sum_slack, _, _ = validate_at_params(tini, w, build_table=False)
+                if not all_ok:
+                    continue
+                cand = (min_slack, sum_slack, tini)
+                if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
+                    best = cand
+        # si no encontramos entero por discretización, devolvemos el centro del primer intervalo
+        if best is None and intervals:
+            s, e = intervals[0]
+            tini = int(((s + e) / 2.0) % float(c_total))
+            return tini
+        return best[2] if best else 0
+
+    def compute_max_band_fixed_offsets():
+        """
+        Maximiza ancho con offsets fijos:
+        - búsqueda binaria de w
+        - selección de mejor t_ini factible
+        """
+        lo, hi = 1, int(verde_min)
+        best_intervals = None
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            intervals = feasible_tini_intervals_for_width(mid)
+            if intervals:
+                lo = mid
+                best_intervals = intervals
+            else:
+                hi = mid - 1
+
+        w_max = lo
+        intervals = feasible_tini_intervals_for_width(w_max)
+        if not intervals:
+            # Por robustez (si lo=1 y aún así no hay), devolvemos algo razonable
+            return 1, st.session_state.t_ini, False
+
+        tini_best = pick_best_tini_from_intervals(intervals, w_max)
+        return int(w_max), int(tini_best), True
+
+    def target_offsets_for_tini_and_width(tini_value, w):
+        """
+        Calcula offsets objetivo para que la banda de ancho w quede centrada
+        dentro del verde de cada cruce (siempre factible si w <= verde_i),
+        para una progresión A→... con velocidad v_ms.
+        """
+        C = float(c_total)
+        targets = []
+        for _, row in df.iterrows():
+            verde = float(row["Verde"])
+            x = float(row["Dist_Acum"])
+            t_arr = (float(tini_value) + (x / v_ms)) % C
+            # centrado: offset = arrival_start - (verde - w)/2
+            left_margin = max(0.0, (verde - float(w)) / 2.0)
+            off = (t_arr - left_margin) % C
+            targets.append(off)
+        return targets
+
+    def compute_max_band_with_offset_changes_minimized():
+        """
+        Ancho máximo global (min verde) + busca t_ini que minimiza cambio de offsets.
+        Devuelve: w_max, tini_best, offsets_objetivo_int
+        """
+        w_max = int(verde_min)
+        C = int(c_total)
+
+        # offsets actuales (del state)
+        current_offsets = [float(st.session_state.get(f"off_{i}", 0)) for i in range(len(df))]
+
+        best = None  # (cost, min_slack, sum_slack, tini, offs_int)
+        for tini in range(C):
+            targets = target_offsets_for_tini_and_width(tini, w_max)
+            # redondeo a entero (lo que usan los sliders)
+            targets_int = [int(round(t)) % C for t in targets]
+            # coste = suma distancias circulares a offsets actuales
+            cost = sum(circular_distance(current_offsets[i], targets_int[i], C) for i in range(len(df)))
+
+            # además puntuamos holguras resultantes (aunque será factible)
+            # Para evaluar holguras, debemos "simular" offsets: aquí evaluamos con offsets objetivos
+            # Sin mutar estado, hacemos evaluación rápida:
+            # guardamos offsets originales, calculamos holguras con una función ad-hoc
+            # (usamos validate_at_params con offsets del df: así que no vale. Hacemos holgura simple centrada)
+            # Como el centrado da holgura teórica = (verde - w)/2, el mínimo global es min((verde-w)/2).
+            min_slack = min((float(row["Verde"]) - w_max) / 2.0 for _, row in df.iterrows())
+            sum_slack = sum((float(row["Verde"]) - w_max) / 2.0 for _, row in df.iterrows())
+
+            cand = (cost, min_slack, sum_slack, tini, targets_int)
+            if best is None:
+                best = cand
+            else:
+                # 1) menor coste, 2) mayor holgura mínima, 3) mayor suma holgura
+                if cand[0] < best[0] - 1e-9:
+                    best = cand
+                elif abs(cand[0] - best[0]) <= 1e-9:
+                    if cand[1] > best[1] + 1e-9:
+                        best = cand
+                    elif abs(cand[1] - best[1]) <= 1e-9 and cand[2] > best[2] + 1e-9:
+                        best = cand
+
+        if best is None:
+            return int(w_max), int(st.session_state.t_ini), [int(current_offsets[i]) % C for i in range(len(df))]
+        return int(w_max), int(best[3]), best[4]
+
+    def aplicar_optimizacion():
+        if modo.startswith("Offsets fijos"):
+            w_max, tini_best, feasible = compute_max_band_fixed_offsets()
+            st.session_state["ancho"] = int(w_max)
+            st.session_state["t_ini"] = int(tini_best)
+            st.session_state["opt_info"] = {
+                "modo": "Offsets fijos",
+                "ancho": int(w_max),
+                "t_ini": int(tini_best),
+                "factible": bool(feasible)
+            }
+            st.rerun()
+
+        else:
+            w_max, tini_best, offs_int = compute_max_band_with_offset_changes_minimized()
+            st.session_state["ancho"] = int(w_max)
+            st.session_state["t_ini"] = int(tini_best)
+            for i, off in enumerate(offs_int):
+                st.session_state[f"off_{i}"] = int(off)
+            st.session_state["opt_info"] = {
+                "modo": "t_ini + offsets",
+                "ancho": int(w_max),
+                "t_ini": int(tini_best),
+                "factible": True
+            }
+            st.rerun()
+
+    st.sidebar.button("📈 Calcular y aplicar banda máxima", on_click=aplicar_optimizacion)
+
+    if "opt_info" in st.session_state:
+        info = st.session_state["opt_info"]
+        if info.get("factible", False):
+            st.sidebar.success(f"Optimización aplicada ({info['modo']}): ancho={info['ancho']} s, t_ini={info['t_ini']} s")
+        else:
+            st.sidebar.warning(f"Optimización parcial ({info['modo']}): mejor ancho={info['ancho']} s, t_ini={info['t_ini']} s (no garantizado)")
+        st.sidebar.caption("Tip: puedes ajustar manualmente y volver a recalcular.")
+
+    # -------------------------
     # VALIDACIÓN ACTUAL (tabla + marcados)
     # -------------------------
     validation_df = None
     invalid_ids = set()
 
     if validar:
-        ok_count, all_ok, _, _, invalid_ids, validation_df = validate_at_tini(t_ini, build_table=True)
+        ok_count, all_ok, min_slack, sum_slack, invalid_ids, validation_df = validate_at_params(
+            st.session_state.t_ini, st.session_state.ancho, build_table=True
+        )
 
         st.sidebar.markdown(f"**Cruces OK:** {ok_count}/{len(df)}")
         if not all_ok:
             st.sidebar.error("Hay cruces fuera de verde para la banda actual.")
         else:
             st.sidebar.success("Banda válida en todos los cruces (ciclo base).")
+        st.sidebar.caption(f"Holgura mínima global: {min_slack:.2f} s | Holgura total: {sum_slack:.2f} s")
 
     # --- GRÁFICO PROFESIONAL ---
     fig = go.Figure()
@@ -313,10 +572,10 @@ def main():
 
     # Dibujar Banda de Progresión
     for k in range(num_ciclos):
-        t0 = k * c_total + t_ini
+        t0 = k * c_total + st.session_state.t_ini
         x_pts = df["Dist_Acum"].tolist()
         y_inf = [t0 + (d / v_ms) for d in x_pts]
-        y_sup = [t + ancho for t in y_inf]
+        y_sup = [t + st.session_state.ancho for t in y_inf]
 
         fig.add_trace(go.Scatter(
             x=x_pts + x_pts[::-1],
@@ -336,7 +595,7 @@ def main():
             cruce = row["ID"]
             if cruce in invalid_ids:
                 x = float(row["Dist_Acum"])
-                t_arr = (float(t_ini) + (x / v_ms)) % C
+                t_arr = (float(st.session_state.t_ini) + (x / v_ms)) % C
                 xs.append(x)
                 ys.append(t_arr)
                 texts.append(f"{cruce} ❌")
@@ -359,7 +618,7 @@ def main():
         height=750
     )
 
-    # ✅ Corrección: nada de use_container_width
+    # Streamlit 2026: width='stretch' / 'content'
     st.plotly_chart(fig, width="stretch")
 
     # --- PANEL DE VALIDACIÓN (TABLA) ---
@@ -367,23 +626,22 @@ def main():
         st.subheader("✅ Validación automática de la banda (ciclo base)")
         st.caption("""
         Comprueba si la banda de progresión (A→...) en el **ciclo base** queda totalmente dentro de verde en cada cruce.  
-        *Holgura (min)* es el margen más restrictivo (el que manda) por cruce.
+        *Holgura (min)* es el margen más restrictivo por cruce.
         """)
-        # ✅ Corrección: use_container_width=True -> width="stretch"
         st.dataframe(validation_df, width="stretch", hide_index=True)
 
     # --- MÉTRICAS ---
     st.divider()
     m1, m2, m3 = st.columns(3)
     m1.metric("Velocidad de Diseño", f"{v_kmh} km/h")
-    m2.metric("Ancho de Banda", f"{ancho} s")
-    m3.metric("Eficiencia", f"{(ancho / c_total) * 100:.1f}%")
+    m2.metric("Ancho de Banda", f"{st.session_state.ancho} s")
+    m3.metric("Eficiencia", f"{(st.session_state.ancho / c_total) * 100:.1f}%")
 
     if validar and validation_df is not None and len(invalid_ids) > 0:
         st.warning(
             "La banda no es válida en todos los cruces. "
-            "Prueba a: (1) Auto-ajustar t_ini, (2) ajustar manualmente t_ini, "
-            "(3) pulsar 'Alinear Offsets', o (4) reducir el ancho de banda."
+            "Prueba a: (1) Optimización real (banda máxima), (2) Auto-ajustar t_ini, "
+            "(3) Alinear offsets, o (4) reducir el ancho."
         )
 
 
